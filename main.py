@@ -1,51 +1,58 @@
 import os
 import asyncio
 import logging
-from pyrogram import Client, filters
+from pyrogram import Client, filters, errors
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 from PIL import Image
 import moviepy.editor as me
+from motor.motor_asyncio import AsyncIOMotorClient
 
-# Logging configuration
+# Logging
 logging.basicConfig(level=logging.INFO)
-
-# Load environment variables
 load_dotenv()
 
+# Konfigurasi dari Gist Terbaru
 try:
     API_ID = int(os.getenv("API_ID"))
     API_HASH = os.getenv("API_HASH")
     BOT_TOKEN = os.getenv("BOT_TOKEN")
     DEVS = int(os.getenv("DEVS"))
-    DB_CHANNEL_ID = int(os.getenv("DB_CHANNEL_ID"))
+    DB_CHANNEL = int(os.getenv("DB_CHANNEL"))
+    STICKER_ID = os.getenv("STICKER_ID")
+    MONGO_URL = os.getenv("MONGO_URL")
 except (TypeError, ValueError) as e:
-    print(f"❌ ERROR: Pastikan variabel .env sudah benar! | {e}")
+    print(f"❌ ERROR: Pastikan semua variabel di .env sudah terisi! | {e}")
     exit()
 
-# ID STIKER WATERMARK
-STICKER_ID = "CAACAgUAAxkBAAEQ2Y9pzAOIPkrkqkB_qkpyqxt-qqoUSAAC_h4AApRBQVZfNG9E_iKx7DoE"
+# MongoDB Setup dengan Prefix "nvs"
+mongo_client = AsyncIOMotorClient(MONGO_URL)
+db = mongo_client["NovusBotDB"]
+users_col = db["nvs_users"] # Koleksi menggunakan prefix nvs
 
 app = Client("TestingNovusBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # Memori Internal
-forwarded_messages = {} # Untuk reply admin
-waiting_caption = {}    # Untuk menyimpan media sementara yang menunggu caption
+forwarded_messages = {}
+waiting_caption = {}
 
-@app.on_message(filters.command("start") & filters.private)
-async def start_cmd(client, message):
-    await message.reply_text(
-        f"👋 **Halo {message.from_user.first_name}!**\n\n"
-        "Selamat datang di **Testing Novus Bot**.\n"
-        "Kirimkan foto atau video untuk donasi ke database.\n\n"
-        "⚠️ **Catatan:** Setiap media wajib memiliki caption/deskripsi."
-    )
+# --- FUNGSI DATABASE ---
+async def add_user(user_id):
+    """Menambah user ke koleksi nvs_users."""
+    await users_col.update_one({"_id": user_id}, {"$set": {"_id": user_id}}, upsert=True)
 
-# --- FUNGSI PROSES MEDIA (Watermark & Send) ---
+async def remove_user(user_id):
+    """Menghapus user (Auto-Cleanup)."""
+    await users_col.delete_one({"_id": user_id})
+
+async def get_all_users():
+    """Mengambil semua ID user untuk broadcast."""
+    return [doc["_id"] async for doc in users_col.find()]
+
+# --- FUNGSI PROSES MEDIA ---
 async def process_and_send(client, user_id, message_obj, caption_text):
     status = await client.send_message(user_id, "⏳ **Sedang memproses watermark...**")
     
-    # Download media dari pesan asli
     file_p = await message_obj.download()
     out_p = f"final_{os.path.basename(file_p)}"
     stk_p = await client.download_media(STICKER_ID)
@@ -57,7 +64,7 @@ async def process_and_send(client, user_id, message_obj, caption_text):
             stk = stk.resize((img.width // 3, int(stk.height * (img.width // 3 / stk.width))), Image.LANCZOS)
             img.paste(stk, ((img.width - stk.width)//2, (img.height - stk.height)//2), stk)
             img.save(out_p, "JPEG", quality=90)
-            await client.send_photo(chat_id=DB_CHANNEL_ID, photo=out_p, caption=caption_text)
+            await client.send_photo(chat_id=DB_CHANNEL, photo=out_p, caption=caption_text)
 
         elif message_obj.video:
             clip = me.VideoFileClip(file_p)
@@ -65,14 +72,14 @@ async def process_and_send(client, user_id, message_obj, caption_text):
             final = me.CompositeVideoClip([clip, logo])
             final.write_videofile(out_p, codec="libx264", audio_codec="aac", logger=None)
             clip.close()
-            await client.send_video(chat_id=DB_CHANNEL_ID, video=out_p, caption=caption_text)
+            await client.send_video(chat_id=DB_CHANNEL, video=out_p, caption=caption_text)
 
-        await status.edit("✅ **Berhasil!** Media telah ber-watermark dan terkirim ke database.")
+        await status.edit("✅ **Berhasil!** Media terkirim ke database.")
         
-        # Teruskan ke Admin sebagai laporan
+        # Laporan ke Admin
         info = await message_obj.forward(DEVS)
         forwarded_messages[info.id] = user_id
-        await client.send_message(DEVS, f"📥 **Donasi Baru dari {message_obj.from_user.mention}**\nID: `{user_id}`\n📝 Caption: {caption_text}")
+        await client.send_message(DEVS, f"📥 **Donasi Baru (Prefix: nvs)**\n👤 User: {message_obj.from_user.mention}\n🆔 ID: `{user_id}`")
 
     except Exception as e:
         logging.error(e)
@@ -82,43 +89,76 @@ async def process_and_send(client, user_id, message_obj, caption_text):
             if f and os.path.exists(f): os.remove(f)
 
 # --- HANDLER UTAMA ---
-@app.on_message(filters.private & ~filters.command("start"))
+
+@app.on_message(filters.command("start") & filters.private)
+async def start_cmd(client, message):
+    await add_user(message.from_user.id)
+    await message.reply_text(
+        f"👋 **Halo {message.from_user.first_name}!**\n\n"
+        "Selamat datang di **Testing Novus Bot**.\n"
+        "Kirim foto atau video untuk donasi. Bot akan otomatis meminta caption jika kosong."
+    )
+
+@app.on_message(filters.command("stats") & filters.user(DEVS))
+async def stats_cmd(client, message):
+    count = await users_col.count_documents({})
+    await message.reply_text(f"📊 **Statistik Database (nvs_users)**\nTotal User: `{count}`")
+
+@app.on_message(filters.command("broadcast") & filters.user(DEVS) & filters.reply)
+async def broadcast_cmd(client, message):
+    all_users = await get_all_users()
+    msg_to_broadcast = message.reply_to_message
+    sent, failed = 0, 0
+    status = await message.reply_text(f"🚀 **Broadcast dimulai...**\nTarget: {len(all_users)} user.")
+
+    for user_id in all_users:
+        try:
+            await msg_to_broadcast.copy(user_id)
+            sent += 1
+            await asyncio.sleep(0.3)
+        except (errors.UserIsBlocked, errors.PeerIdInvalid, errors.InputUserDeactivated):
+            await remove_user(user_id) # Hapus user yang sudah tidak aktif
+            failed += 1
+        except Exception:
+            failed += 1
+
+    await status.edit(f"✅ **Broadcast Selesai!**\n\nBerhasil: `{sent}`\nGagal/Dihapus: `{failed}`")
+
+@app.on_message(filters.private & ~filters.command(["start", "stats", "broadcast"]))
 async def handle_everything(client, message):
     user_id = message.from_user.id
+    await add_user(user_id) # Simpan setiap user baru
 
-    # 1. LOGIKA ADMIN BALAS MEMBER
+    # 1. Balas Member oleh Admin
     if user_id == DEVS and message.reply_to_message:
         target_id = forwarded_messages.get(message.reply_to_message.id)
         if target_id:
             try:
-                await client.copy_message(chat_id=target_id, from_chat_id=message.chat.id, message_id=message.id)
-                await message.reply_text(f"✅ Terbalas ke `{target_id}`")
-            except Exception as e:
-                await message.reply_text(f"❌ Gagal balas: {e}")
+                await client.copy_message(target_id, message.chat.id, message.id)
+                await message.reply_text("✅ Terbalas.")
+            except: pass
         return
 
-    # 2. LOGIKA MENERIMA CAPTION SUSULAN
+    # 2. Menunggu Caption Media
     if user_id in waiting_caption and message.text:
-        media_msg = waiting_caption.pop(user_id) # Ambil media yang disimpan tadi
+        media_msg = waiting_caption.pop(user_id)
         await process_and_send(client, user_id, media_msg, message.text)
         return
 
-    # 3. LOGIKA MEMBER KIRIM MEDIA
+    # 3. Kirim Media
     if message.photo or message.video:
         if message.caption:
-            # Jika sudah ada caption, langsung proses
             await process_and_send(client, user_id, message, message.caption)
         else:
-            # Jika tidak ada caption, simpan pesan media dan minta teks
             waiting_caption[user_id] = message
-            await message.reply_text("⚠️ **Media terdeteksi tanpa caption!**\n\nSilakan ketikkan deskripsi/caption untuk foto/video ini agar bisa saya proses.")
+            await message.reply_text("⚠️ **Kirimkan caption untuk media ini!**")
         return
 
-    # 4. LOGIKA CHAT TEXT BIASA
+    # 4. Chat Biasa
     if user_id != DEVS:
         fw = await message.forward(DEVS)
         forwarded_messages[fw.id] = user_id
         await client.send_message(DEVS, f"📩 **Pesan dari {message.from_user.mention}**\nID: `{user_id}`")
 
-print("🚀 Bot Siap! Sistem Antrean Caption Aktif.")
+print("🚀 Bot Novus Berjalan! Koleksi: nvs_users")
 app.run()
