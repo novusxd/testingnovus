@@ -12,7 +12,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
-# Ambil data dari .env (Gist Terbaru)
+# Ambil data dari .env
 try:
     API_ID = int(os.getenv("API_ID"))
     API_HASH = os.getenv("API_HASH")
@@ -21,19 +21,17 @@ try:
     DB_CHANNEL = int(os.getenv("DB_CHANNEL"))
     STICKER_ID = os.getenv("STICKER_ID")
     MONGO_URL = os.getenv("MONGO_URL")
-    INVITE_LINK = os.getenv("INVITE_LINK")
 except (TypeError, ValueError) as e:
     print(f"❌ ERROR: Konfigurasi .env tidak valid! | {e}")
     exit()
 
-# MongoDB Setup (Prefix: nvs)
+# MongoDB Setup
 mongo_client = AsyncIOMotorClient(MONGO_URL)
 db = mongo_client["NovusBotDB"]
 users_col = db["nvs_users"]
 
 app = Client("TestingNovusBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Antrean & Memori
 forwarded_messages = {}
 waiting_caption = {}
 
@@ -47,29 +45,21 @@ async def remove_user(user_id):
 async def get_all_users():
     return [doc["_id"] async for doc in users_col.find()]
 
-# --- FUNGSI PENGAKTIFAN CHANNEL (Mencegah Peer ID Invalid) ---
-async def ensure_channel_access():
+# --- FUNGSI FIX PEER ID (SILENT PING) ---
+async def fix_peer_id():
+    """Memaksa bot mengenali ID Channel dengan mengirim pesan lalu menghapusnya."""
     print(f"🔄 Sinkronisasi ID Channel: {DB_CHANNEL}...")
     try:
-        # Coba cara normal dulu
-        chat = await app.get_chat(DB_CHANNEL)
-        print(f"✅ Channel Terdeteksi: {chat.title}")
-    except Exception:
-        try:
-            # Jika gagal, paksa gunakan Invite Link
-            if INVITE_LINK:
-                await app.join_chat(INVITE_LINK)
-                print("✅ Berhasil Sinkronisasi ID via Invite Link!")
-            else:
-                print("⚠️ INVITE_LINK kosong di .env. Sinkronisasi gagal.")
-        except errors.UserAlreadyParticipant:
-            # Jika sudah join tapi ID masih "asing", kirim sinyal typing
-            await app.send_chat_action(DB_CHANNEL, "typing")
-            print("✅ ID Channel disinkronkan (Sudah bergabung).")
-        except Exception as e:
-            print(f"❌ Gagal sinkronisasi channel: {e}")
+        # Kirim pesan pancingan agar Bot mengenal ID ini
+        pancing = await app.send_message(DB_CHANNEL, "🔄 *Bot System Synchronizing...*")
+        await asyncio.sleep(1)
+        await pancing.delete() # Hapus lagi agar channel tetap bersih
+        print("✅ Sinkronisasi ID Berhasil! Bot sekarang mengenali Channel Database.")
+    except Exception as e:
+        print(f"❌ Gagal sinkronisasi: {e}")
+        print("⚠️ Pastikan Bot sudah menjadi ADMIN di channel dan memiliki izin 'Post Messages'.")
 
-# --- FUNGSI WATERMARK MEDIA ---
+# --- FUNGSI PROSES MEDIA ---
 async def process_media(client, user_id, message_obj, caption_text):
     status = await client.send_message(user_id, "⏳ **Memproses watermark...**")
     file_p = await message_obj.download()
@@ -158,10 +148,10 @@ async def handle_msg(client, message):
         forwarded_messages[fw.id] = u_id
         await client.send_message(DEVS, f"📩 **Pesan dari {message.from_user.mention}**\nID: `{u_id}`")
 
-# --- RUNNER ---
+# --- BOOTSTRAP ---
 async def main():
     await app.start()
-    await ensure_channel_access() # Trick Invite Link Jalan di Sini
+    await fix_peer_id() # Sinkronisasi ID via pesan pancingan
     print("🚀 Bot Novus Aktif & Database Sinkron!")
     await asyncio.Event().wait()
 
