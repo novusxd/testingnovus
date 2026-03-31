@@ -28,8 +28,9 @@ STICKER_ID = "CAACAgUAAxkBAAEQ2Y9pzAOIPkrkqkB_qkpyqxt-qqoUSAAC_h4AApRBQVZfNG9E_i
 
 app = Client("TestingNovusBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# State user (0: Chat Biasa, 1: Mode Donasi)
+# State user dan Memori Pesan
 user_states = {}
+forwarded_messages = {} # Memori internal untuk melacak ID dari pesan yang diforward
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_cmd(client, message):
@@ -37,7 +38,7 @@ async def start_cmd(client, message):
     teks = (
         f"👋 **Halo {first_name}!**\n\n"
         "Selamat datang di **Testing Novus Bot**. 🛡️\n"
-        "Gunakan tombol di bawah untuk donasi media."
+        "Gunakan tombol di bawah untuk mulai donasi media."
     )
     await message.reply_text(
         teks,
@@ -51,7 +52,7 @@ async def start_cmd(client, message):
 async def donasi_callback(client, callback_query):
     user_id = callback_query.from_user.id
     user_states[user_id] = 1
-    await callback_query.message.reply("📸 **MODE DONASI AKTIF**\n\nKirimkan Foto/Video Anda sekarang.")
+    await callback_query.message.reply("📸 **MODE DONASI AKTIF**\n\nSilakan kirimkan Foto atau Video Anda sekarang.")
     await callback_query.answer()
 
 @app.on_message(filters.private & ~filters.command("start"))
@@ -59,22 +60,26 @@ async def handle_messages(client, message):
     user_id = message.from_user.id
     state = user_states.get(user_id, 0)
 
-    # --- LOGIKA ADMIN BALAS MEMBER (Sesuai Permintaan Anda) ---
+    # --- LOGIKA ADMIN BALAS MEMBER ---
     if user_id == DEVS and message.reply_to_message:
         target_id = None
+        replied_msg_id = message.reply_to_message.id
         
-        # 1. Cek dari Metadata Forward (Diteruskan dari...)
-        if message.reply_to_message.forward_from:
+        # 1. Cek dari Memori Internal (Paling Akurat & Tahan Privacy Settings)
+        if replied_msg_id in forwarded_messages:
+            target_id = forwarded_messages[replied_msg_id]
+        
+        # 2. Cadangan: Cek dari Metadata Telegram (Jika bot sempat direstart)
+        elif message.reply_to_message.forward_from:
             target_id = message.reply_to_message.forward_from.id
         
-        # 2. Cek dari Teks Info (Jika profil member diprivat)
+        # 3. Cadangan Terakhir: Cek dari Teks Info
         else:
             try:
                 txt = message.reply_to_message.text or message.reply_to_message.caption
-                if "🆔 ID: `" in txt:
+                if txt and "🆔 ID: `" in txt:
                     target_id = int(txt.split("🆔 ID: `")[1].split("`")[0])
-            except:
-                pass
+            except: pass
 
         if target_id:
             try:
@@ -84,22 +89,22 @@ async def handle_messages(client, message):
                     message_id=message.id,
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Donasi Lagi", callback_data="start_donasi")]])
                 )
-                await message.reply_text(f"✅ Terbalas ke `{target_id}`")
+                await message.reply_text(f"✅ Pesan sukses dikirim ke `{target_id}`")
                 return
             except Exception as e:
-                await message.reply_text(f"❌ Gagal: {e}")
+                await message.reply_text(f"❌ Gagal mengirim: Member mungkin memblokir bot atau error {e}")
                 return
         else:
-            await message.reply_text("❌ Gagal: Reply pesan 'Diteruskan dari' atau pesan info ID dari bot.")
+            await message.reply_text("❌ Gagal: Tidak bisa mendeteksi ID. Pastikan Anda mereply pesan yang diteruskan langsung dari bot.")
             return
 
     # --- LOGIKA MEMBER KIRIM MEDIA DONASI ---
     if state == 1:
         if not (message.photo or message.video):
-            await message.reply("⚠️ Kirim Foto atau Video saja.")
+            await message.reply("⚠️ Kirim Foto atau Video saja untuk donasi.")
             return
 
-        status = await message.reply("⏳ **Memproses...**")
+        status = await message.reply("⏳ **Memproses watermark...**")
         file_p = await message.download()
         out_p = f"output_{os.path.basename(file_p)}"
         stk_p = await client.download_media(STICKER_ID)
@@ -121,11 +126,11 @@ async def handle_messages(client, message):
                 clip.close()
                 await client.send_video(DB_CHANNEL_ID, out_p, caption=f"📥 **DONASI VIDEO**\n👤 User: `{user_id}`\n📝 {message.caption or '-'}")
 
-            await message.reply("✅ Donasi terkirim ke Database!")
+            await message.reply("✅ Media donasi berhasil dikirim ke Database!")
             user_states[user_id] = 0
         except Exception as e:
             logging.error(e)
-            await message.reply(f"❌ Error: {e}")
+            await message.reply(f"❌ Terjadi kesalahan: {e}")
         finally:
             for f in [file_p, out_p, stk_p]:
                 if f and os.path.exists(f): os.remove(f)
@@ -134,12 +139,15 @@ async def handle_messages(client, message):
 
     # --- LOGIKA MEMBER CHAT KE ADMIN ---
     if user_id != DEVS:
-        # Pesan 1: Meneruskan pesan asli member agar muncul "Diteruskan dari..."
-        await message.forward(DEVS)
+        # 1. Forward pesan asli ke Admin
+        fw_msg = await message.forward(DEVS)
         
-        # Pesan 2: Informasi ID (Sebagai cadangan jika profil member privat)
-        info = f"📩 **Pesan Baru**\n👤 Member: {message.from_user.mention}\n🆔 ID: `{user_id}`"
+        # 2. Simpan ID ke dalam memori internal bot
+        forwarded_messages[fw_msg.id] = user_id
+        
+        # 3. Kirim notifikasi singkat ke admin (Opsional, tapi bagus untuk memastikan pesan masuk)
+        info = f"📩 **Pesan Masuk**\n👤 Dari: {message.from_user.mention}\n🆔 ID: `{user_id}`\n\n👉 *Silakan langsung reply pesan yang diforward di atas.*"
         await client.send_message(DEVS, info)
 
-print("🚀 Bot Siap Beraksi!")
+print("🚀 Bot Siap! Sistem Memori Anti-Private Aktif.")
 app.run()
