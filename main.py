@@ -10,7 +10,7 @@ import moviepy.editor as me
 # Konfigurasi Logging
 logging.basicConfig(level=logging.INFO)
 
-# Memuat konfigurasi dari .env (Gist Terbaru)
+# Load environment variables
 load_dotenv()
 
 try:
@@ -20,140 +20,123 @@ try:
     DEVS = int(os.getenv("DEVS"))
     DB_CHANNEL_ID = int(os.getenv("DB_CHANNEL_ID"))
 except (TypeError, ValueError) as e:
-    print(f"❌ ERROR: Gagal memuat .env! Pastikan variabel sudah benar. | {e}")
+    print(f"❌ ERROR: Konfigurasi .env tidak valid! | {e}")
     exit()
 
-# ID STIKER UNTUK WATERMARK (Novus Sticker)
+# ID STIKER WATERMARK
 STICKER_ID = "CAACAgUAAxkBAAEQ2Y9pzAOIPkrkqkB_qkpyqxt-qqoUSAAC_h4AApRBQVZfNG9E_iKx7DoE"
 
 app = Client("TestingNovusBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# State user (0: Chat Biasa, 1: Mode Donasi Media)
+# State user (0: Chat, 1: Donasi)
 user_states = {}
 
-# --- FUNGSI START (@TestingNovusBot) ---
 @app.on_message(filters.command("start") & filters.private)
 async def start_cmd(client, message):
     first_name = message.from_user.first_name
-    teks_sambutan = (
+    teks = (
         f"👋 **Halo {first_name}!**\n\n"
         "Selamat datang di **Testing Novus Bot**. 🛡️\n\n"
-        "Bot ini adalah pusat layanan komunikasi dan donasi komunitas Novus.\n"
-        "✨ **Apa yang bisa Anda lakukan?**\n"
-        "💬 **Chat Langsung:** Kirim pesan apa saja, Admin akan membalasnya.\n"
-        "📥 **Donasi Konten:** Kirim foto/video untuk meramaikan channel database.\n\n"
-        "Klik tombol di bawah jika ingin mulai mengirim media donasi!"
+        "💬 **Chat:** Kirim pesan untuk tanya jawab dengan Admin.\n"
+        "📥 **Donasi:** Klik tombol di bawah untuk kirim foto/video ke Database.\n\n"
+        "Silakan pilih menu di bawah ini:"
     )
-    
     await message.reply_text(
-        teks_sambutan,
+        teks,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📸 Mulai Donasi Sekarang", callback_data="start_donasi")],
-            [InlineKeyboardButton("🌐 Kunjungi Website", url="https://novus.web.id")]
+            [InlineKeyboardButton("🌐 Website Novus", url="https://novus.web.id")]
         ])
     )
 
-# --- CALLBACK UNTUK TOMBOL DONASI ---
 @app.on_callback_query(filters.regex("start_donasi"))
 async def donasi_callback(client, callback_query):
     user_id = callback_query.from_user.id
     user_states[user_id] = 1
-    await callback_query.message.reply(
-        "📸 **MODE DONASI AKTIF**\n\n"
-        "Silakan kirimkan **Foto atau Video** Anda sekarang.\n"
-        "Media akan otomatis diberi stiker Novus di posisi tengah."
-    )
+    await callback_query.message.reply("📸 **MODE DONASI AKTIF**\n\nKirimkan Foto/Video Anda sekarang. Bot akan menempelkan stiker otomatis.")
     await callback_query.answer()
 
-# --- HANDLER PESAN MASUK ---
 @app.on_message(filters.private & ~filters.command("start"))
 async def handle_messages(client, message):
     user_id = message.from_user.id
     state = user_states.get(user_id, 0)
 
-    # A. LOGIKA ADMIN BALAS MEMBER (Metode Reply)
+    # --- LOGIKA ADMIN BALAS MEMBER (SMART REPLY) ---
     if user_id == DEVS and message.reply_to_message:
+        target_id = None
+        
+        # 1. Cek jika mereply pesan info bot (ada teks ID)
         try:
-            # Mengambil ID dari teks info bot
-            target_text = message.reply_to_message.text or message.reply_to_message.caption
-            target_id = int(target_text.split("ID: `")[1].split("`")[0])
-            
-            await client.copy_message(
-                chat_id=target_id,
-                from_chat_id=message.chat.id,
-                message_id=message.id,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Donasi Sekarang", callback_data="start_donasi")]])
-            )
-            await message.reply_text(f"✅ Pesan terbalas ke `{target_id}`")
-        except Exception:
-            await message.reply_text("❌ Gagal balas: Reply pesan info ID dari bot.")
-        return
+            txt = message.reply_to_message.text or message.reply_to_message.caption
+            if "ID: `" in txt:
+                target_id = int(txt.split("ID: `")[1].split("`")[0])
+        except: pass
 
-    # B. LOGIKA MEMBER KIRIM MEDIA (MODE DONASI)
-    if state == 1:
-        if not (message.photo or message.video):
-            await message.reply("⚠️ Mohon kirimkan Foto atau Video. Kirim pesan biasa untuk chat.")
+        # 2. Cek jika mereply pesan yang diforward langsung (jika profil tidak diprivat)
+        if not target_id and message.reply_to_message.forward_from:
+            target_id = message.reply_to_message.forward_from.id
+
+        if target_id:
+            try:
+                await client.copy_message(
+                    chat_id=target_id,
+                    from_chat_id=message.chat.id,
+                    message_id=message.id,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Donasi Lagi", callback_data="start_donasi")]])
+                )
+                await message.reply_text(f"✅ Balasan terkirim ke `{target_id}`")
+                return
+            except Exception as e:
+                await message.reply_text(f"❌ Gagal kirim: {e}")
+                return
+        else:
+            await message.reply_text("❌ Gagal: Reply pesan info dari bot agar ID terdeteksi.")
             return
 
-        status_msg = await message.reply("⏳ **Sedang memproses media...**")
-        file_path = await message.download()
-        output_path = f"novus_{os.path.basename(file_path)}"
-        sticker_path = await client.download_media(STICKER_ID)
+    # --- LOGIKA MEMBER KIRIM DONASI ---
+    if state == 1:
+        if not (message.photo or message.video):
+            await message.reply("⚠️ Mohon kirim Foto atau Video saja.")
+            return
+
+        status = await message.reply("⏳ **Memproses...**")
+        file_p = await message.download()
+        out_p = f"output_{os.path.basename(file_p)}"
+        stk_p = await client.download_media(STICKER_ID)
 
         try:
-            # PROSES FOTO
             if message.photo:
-                img = Image.open(file_path).convert("RGB")
-                stk = Image.open(sticker_path).convert("RGBA")
-                stk_w = img.width // 3
-                w_percent = (stk_w / float(stk.size[0]))
-                stk_h = int((float(stk.size[1]) * float(w_percent)))
-                stk = stk.resize((stk_w, stk_h), Image.LANCZOS)
-                pos = ((img.width - stk.width) // 2, (img.height - stk.height) // 2)
-                img.paste(stk, pos, stk)
-                img.save(output_path, "JPEG", quality=90)
-                
-                await client.send_photo(
-                    DB_CHANNEL_ID, 
-                    output_path, 
-                    caption=f"📥 **DONASI FOTO**\n👤 User: `{user_id}`\n📝 Caption: {message.caption or '-'}"
-                )
+                img = Image.open(file_p).convert("RGB")
+                stk = Image.open(stk_p).convert("RGBA")
+                stk = stk.resize((img.width // 3, int(stk.height * (img.width // 3 / stk.width))), Image.LANCZOS)
+                img.paste(stk, ((img.width - stk.width)//2, (img.height - stk.height)//2), stk)
+                img.save(out_p, "JPEG", quality=90)
+                await client.send_photo(DB_CHANNEL_ID, out_p, caption=f"📥 **DONASI FOTO**\n👤 User: `{user_id}`\n📝 {message.caption or '-'}")
 
-            # PROSES VIDEO
             elif message.video:
-                clip = me.VideoFileClip(file_path)
-                logo = (me.ImageClip(sticker_path)
-                        .set_duration(clip.duration)
-                        .resize(height=clip.h // 4)
-                        .set_pos("center"))
+                clip = me.VideoFileClip(file_p)
+                logo = (me.ImageClip(stk_p).set_duration(clip.duration).resize(height=clip.h // 4).set_pos("center"))
                 final = me.CompositeVideoClip([clip, logo])
-                final.write_videofile(output_path, codec="libx264", audio_codec="aac", logger=None)
+                final.write_videofile(out_p, codec="libx264", audio_codec="aac", logger=None)
                 clip.close()
-                
-                await client.send_video(
-                    DB_CHANNEL_ID, 
-                    output_path, 
-                    caption=f"📥 **DONASI VIDEO**\n👤 User: `{user_id}`\n📝 Caption: {message.caption or '-'}"
-                )
+                await client.send_video(DB_CHANNEL_ID, out_p, caption=f"📥 **DONASI VIDEO**\n👤 User: `{user_id}`\n📝 {message.caption or '-'}")
 
-            await message.reply("✅ **Terima kasih!** Donasi telah terkirim ke Database.")
-            user_states[user_id] = 0 # Kembali ke mode chat biasa
-            
+            await message.reply("✅ Donasi terkirim!")
+            user_states[user_id] = 0
         except Exception as e:
-            logging.error(f"Error: {e}")
-            await message.reply("❌ Gagal memproses media. Silakan coba lagi nanti.")
+            logging.error(e)
+            await message.reply("❌ Error saat memproses.")
         finally:
-            # Hapus file dari VPS (Cleanup)
-            for f in [file_path, output_path, sticker_path]:
+            for f in [file_p, out_p, stk_p]:
                 if f and os.path.exists(f): os.remove(f)
-            await status_msg.delete()
+            await status.delete()
         return
 
-    # C. LOGIKA MEMBER CHAT KE ADMIN (MODE CHAT)
+    # --- LOGIKA MEMBER CHAT KE ADMIN ---
     if user_id != DEVS:
-        info_text = f"📩 **Pesan Baru**\n👤 Dari: {message.from_user.mention}\n🆔 ID: `{user_id}`\n\n👉 **Reply pesan ini untuk membalas.**"
+        info = f"📩 **Pesan Baru**\n👤 Dari: {message.from_user.mention}\n🆔 ID: `{user_id}`\n\n👉 **Reply pesan ini untuk membalas.**"
         await message.forward(DEVS)
-        await client.send_message(DEVS, info_text)
+        await client.send_message(DEVS, info)
 
-print("🚀 TestingNovusBot Berjalan!")
+print("🚀 Bot Berjalan...")
 app.run()
