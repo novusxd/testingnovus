@@ -8,11 +8,11 @@ from PIL import Image
 import moviepy.editor as me
 from motor.motor_asyncio import AsyncIOMotorClient
 
-# Logging
+# Konfigurasi Logging
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
-# Konfigurasi
+# Ambil data dari .env (Gist Terbaru)
 try:
     API_ID = int(os.getenv("API_ID"))
     API_HASH = os.getenv("API_HASH")
@@ -21,18 +21,19 @@ try:
     DB_CHANNEL = int(os.getenv("DB_CHANNEL"))
     STICKER_ID = os.getenv("STICKER_ID")
     MONGO_URL = os.getenv("MONGO_URL")
+    INVITE_LINK = os.getenv("INVITE_LINK")
 except (TypeError, ValueError) as e:
-    print(f"❌ ERROR: Pastikan .env lengkap! | {e}")
+    print(f"❌ ERROR: Konfigurasi .env tidak valid! | {e}")
     exit()
 
-# MongoDB Setup
+# MongoDB Setup (Prefix: nvs)
 mongo_client = AsyncIOMotorClient(MONGO_URL)
 db = mongo_client["NovusBotDB"]
 users_col = db["nvs_users"]
 
 app = Client("TestingNovusBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Memori Internal
+# Antrean & Memori
 forwarded_messages = {}
 waiting_caption = {}
 
@@ -46,20 +47,31 @@ async def remove_user(user_id):
 async def get_all_users():
     return [doc["_id"] async for doc in users_col.find()]
 
-# --- FUNGSI AUTO-RESOLVE CHANNEL ---
-async def resolve_database_channel():
-    """Memaksa bot mengenali channel database saat startup."""
+# --- FUNGSI PENGAKTIFAN CHANNEL (Mencegah Peer ID Invalid) ---
+async def ensure_channel_access():
+    print(f"🔄 Sinkronisasi ID Channel: {DB_CHANNEL}...")
     try:
+        # Coba cara normal dulu
         chat = await app.get_chat(DB_CHANNEL)
-        print(f"✅ Berhasil mengenali Channel: {chat.title} ({DB_CHANNEL})")
-    except Exception as e:
-        print(f"⚠️ PERINGATAN: Bot belum bisa mengenali channel {DB_CHANNEL}.")
-        print(f"Pastikan bot sudah menjadi ADMIN di channel tersebut! Error: {e}")
+        print(f"✅ Channel Terdeteksi: {chat.title}")
+    except Exception:
+        try:
+            # Jika gagal, paksa gunakan Invite Link
+            if INVITE_LINK:
+                await app.join_chat(INVITE_LINK)
+                print("✅ Berhasil Sinkronisasi ID via Invite Link!")
+            else:
+                print("⚠️ INVITE_LINK kosong di .env. Sinkronisasi gagal.")
+        except errors.UserAlreadyParticipant:
+            # Jika sudah join tapi ID masih "asing", kirim sinyal typing
+            await app.send_chat_action(DB_CHANNEL, "typing")
+            print("✅ ID Channel disinkronkan (Sudah bergabung).")
+        except Exception as e:
+            print(f"❌ Gagal sinkronisasi channel: {e}")
 
-# --- FUNGSI PROSES MEDIA ---
-async def process_and_send(client, user_id, message_obj, caption_text):
-    status = await client.send_message(user_id, "⏳ **Sedang memproses watermark...**")
-    
+# --- FUNGSI WATERMARK MEDIA ---
+async def process_media(client, user_id, message_obj, caption_text):
+    status = await client.send_message(user_id, "⏳ **Memproses watermark...**")
     file_p = await message_obj.download()
     out_p = f"final_{os.path.basename(file_p)}"
     stk_p = await client.download_media(STICKER_ID)
@@ -71,31 +83,25 @@ async def process_and_send(client, user_id, message_obj, caption_text):
             stk = stk.resize((img.width // 3, int(stk.height * (img.width // 3 / stk.width))), Image.LANCZOS)
             img.paste(stk, ((img.width - stk.width)//2, (img.height - stk.height)//2), stk)
             img.save(out_p, "JPEG", quality=90)
-            await client.send_photo(chat_id=DB_CHANNEL, photo=out_p, caption=caption_text)
-
+            await client.send_photo(DB_CHANNEL, out_p, caption=caption_text)
         elif message_obj.video:
             clip = me.VideoFileClip(file_p)
             logo = (me.ImageClip(stk_p).set_duration(clip.duration).resize(height=clip.h // 4).set_pos("center"))
             final = me.CompositeVideoClip([clip, logo])
             final.write_videofile(out_p, codec="libx264", audio_codec="aac", logger=None)
             clip.close()
-            await client.send_video(chat_id=DB_CHANNEL, video=out_p, caption=caption_text)
+            await client.send_video(DB_CHANNEL, out_p, caption=caption_text)
 
-        await status.edit("✅ **Berhasil!** Media terkirim ke database.")
-        
+        await status.edit("✅ **Tersimpan di Database!**")
         info = await message_obj.forward(DEVS)
         forwarded_messages[info.id] = user_id
-        await client.send_message(DEVS, f"📥 **Donasi Baru (nvs)**\n👤 User: {message_obj.from_user.mention}\n🆔 ID: `{user_id}`")
-
     except Exception as e:
-        logging.error(e)
-        await status.edit(f"❌ Gagal memproses: {e}")
+        await status.edit(f"❌ Gagal: {e}")
     finally:
         for f in [file_p, out_p, stk_p]:
             if f and os.path.exists(f): os.remove(f)
 
-# --- HANDLER ---
-
+# --- HANDLERS ---
 @app.on_message(filters.command("start") & filters.private)
 async def start_cmd(client, message):
     await add_user(message.from_user.id)
@@ -104,67 +110,60 @@ async def start_cmd(client, message):
 @app.on_message(filters.command("stats") & filters.user(DEVS))
 async def stats_cmd(client, message):
     count = await users_col.count_documents({})
-    await message.reply_text(f"📊 **Statistik Database (nvs_users)**\nTotal User: `{count}`")
+    await message.reply_text(f"📊 **Statistik Database**\nTotal User (nvs): `{count}`")
 
 @app.on_message(filters.command("broadcast") & filters.user(DEVS) & filters.reply)
 async def broadcast_cmd(client, message):
     all_users = await get_all_users()
-    msg_to_broadcast = message.reply_to_message
+    msg = message.reply_to_message
     sent, failed = 0, 0
-    status = await message.reply_text(f"🚀 **Broadcast dimulai...**")
-
-    for user_id in all_users:
+    status = await message.reply_text(f"🚀 **Broadcast sedang jalan...**")
+    for u_id in all_users:
         try:
-            await msg_to_broadcast.copy(user_id)
+            await msg.copy(u_id)
             sent += 1
             await asyncio.sleep(0.3)
-        except (errors.UserIsBlocked, errors.PeerIdInvalid, errors.InputUserDeactivated):
-            await remove_user(user_id)
-            failed += 1
         except Exception:
+            await remove_user(u_id)
             failed += 1
-
-    await status.edit(f"✅ **Selesai!**\nBerhasil: `{sent}`\nGagal: `{failed}`")
+    await status.edit(f"✅ Selesai!\nBerhasil: `{sent}`\nGagal/Dihapus: `{failed}`")
 
 @app.on_message(filters.private & ~filters.command(["start", "stats", "broadcast"]))
-async def handle_everything(client, message):
-    user_id = message.from_user.id
-    await add_user(user_id)
+async def handle_msg(client, message):
+    u_id = message.from_user.id
+    await add_user(u_id)
 
-    if user_id == DEVS and message.reply_to_message:
-        target_id = forwarded_messages.get(message.reply_to_message.id)
-        if target_id:
-            try:
-                await client.copy_message(target_id, message.chat.id, message.id)
-                await message.reply_text("✅ Terbalas.")
+    if u_id == DEVS and message.reply_to_message:
+        target = forwarded_messages.get(message.reply_to_message.id)
+        if target:
+            try: await client.copy_message(target, message.chat.id, message.id)
             except: pass
         return
 
-    if user_id in waiting_caption and message.text:
-        media_msg = waiting_caption.pop(user_id)
-        await process_and_send(client, user_id, media_msg, message.text)
+    if u_id in waiting_caption and message.text:
+        media_msg = waiting_caption.pop(u_id)
+        await process_media(client, u_id, media_msg, message.text)
         return
 
     if message.photo or message.video:
         if message.caption:
-            await process_and_send(client, user_id, message, message.caption)
+            await process_media(client, u_id, message, message.caption)
         else:
-            waiting_caption[user_id] = message
-            await message.reply_text("⚠️ **Kirimkan caption untuk media ini!**")
+            waiting_caption[u_id] = message
+            await message.reply_text("⚠️ **Berikan caption/deskripsi untuk media ini!**")
         return
 
-    if user_id != DEVS:
+    if u_id != DEVS:
         fw = await message.forward(DEVS)
-        forwarded_messages[fw.id] = user_id
-        await client.send_message(DEVS, f"📩 **Pesan dari {message.from_user.mention}**\nID: `{user_id}`")
+        forwarded_messages[fw.id] = u_id
+        await client.send_message(DEVS, f"📩 **Pesan dari {message.from_user.mention}**\nID: `{u_id}`")
 
-# --- BOOTSTRAP ---
+# --- RUNNER ---
 async def main():
     await app.start()
-    await resolve_database_channel() # Langkah Kunci: Kenali Channel Database
-    print("🚀 Bot Novus Aktif & Siap!")
+    await ensure_channel_access() # Trick Invite Link Jalan di Sini
+    print("🚀 Bot Novus Aktif & Database Sinkron!")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    asyncio.run(main())
