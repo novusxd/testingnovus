@@ -4,3 +4,5 @@ python-dotenv
 pillow
 moviepy==1.0.3
 proglog
+motor
+dnspython
