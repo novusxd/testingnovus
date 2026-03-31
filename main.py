@@ -20,7 +20,7 @@ try:
     DEVS = int(os.getenv("DEVS"))
     DB_CHANNEL_ID = int(os.getenv("DB_CHANNEL_ID"))
 except (TypeError, ValueError) as e:
-    print(f"❌ ERROR: Konfigurasi .env bermasalah! | {e}")
+    print(f"❌ ERROR: Pastikan variabel .env sudah benar! | {e}")
     exit()
 
 # ID STIKER WATERMARK
@@ -28,126 +28,97 @@ STICKER_ID = "CAACAgUAAxkBAAEQ2Y9pzAOIPkrkqkB_qkpyqxt-qqoUSAAC_h4AApRBQVZfNG9E_i
 
 app = Client("TestingNovusBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# State user dan Memori Pesan
-user_states = {}
-forwarded_messages = {} # Memori internal untuk melacak ID dari pesan yang diforward
+# Memori Internal
+forwarded_messages = {} # Untuk reply admin
+waiting_caption = {}    # Untuk menyimpan media sementara yang menunggu caption
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_cmd(client, message):
-    first_name = message.from_user.first_name
-    teks = (
-        f"👋 **Halo {first_name}!**\n\n"
-        "Selamat datang di **Testing Novus Bot**. 🛡️\n"
-        "Gunakan tombol di bawah untuk mulai donasi media."
-    )
     await message.reply_text(
-        teks,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📸 Mulai Donasi Sekarang", callback_data="start_donasi")],
-            [InlineKeyboardButton("🌐 Website Novus", url="https://novus.web.id")]
-        ])
+        f"👋 **Halo {message.from_user.first_name}!**\n\n"
+        "Selamat datang di **Testing Novus Bot**.\n"
+        "Kirimkan foto atau video untuk donasi ke database.\n\n"
+        "⚠️ **Catatan:** Setiap media wajib memiliki caption/deskripsi."
     )
 
-@app.on_callback_query(filters.regex("start_donasi"))
-async def donasi_callback(client, callback_query):
-    user_id = callback_query.from_user.id
-    user_states[user_id] = 1
-    await callback_query.message.reply("📸 **MODE DONASI AKTIF**\n\nSilakan kirimkan Foto atau Video Anda sekarang.")
-    await callback_query.answer()
+# --- FUNGSI PROSES MEDIA (Watermark & Send) ---
+async def process_and_send(client, user_id, message_obj, caption_text):
+    status = await client.send_message(user_id, "⏳ **Sedang memproses watermark...**")
+    
+    # Download media dari pesan asli
+    file_p = await message_obj.download()
+    out_p = f"final_{os.path.basename(file_p)}"
+    stk_p = await client.download_media(STICKER_ID)
 
+    try:
+        if message_obj.photo:
+            img = Image.open(file_p).convert("RGB")
+            stk = Image.open(stk_p).convert("RGBA")
+            stk = stk.resize((img.width // 3, int(stk.height * (img.width // 3 / stk.width))), Image.LANCZOS)
+            img.paste(stk, ((img.width - stk.width)//2, (img.height - stk.height)//2), stk)
+            img.save(out_p, "JPEG", quality=90)
+            await client.send_photo(chat_id=DB_CHANNEL_ID, photo=out_p, caption=caption_text)
+
+        elif message_obj.video:
+            clip = me.VideoFileClip(file_p)
+            logo = (me.ImageClip(stk_p).set_duration(clip.duration).resize(height=clip.h // 4).set_pos("center"))
+            final = me.CompositeVideoClip([clip, logo])
+            final.write_videofile(out_p, codec="libx264", audio_codec="aac", logger=None)
+            clip.close()
+            await client.send_video(chat_id=DB_CHANNEL_ID, video=out_p, caption=caption_text)
+
+        await status.edit("✅ **Berhasil!** Media telah ber-watermark dan terkirim ke database.")
+        
+        # Teruskan ke Admin sebagai laporan
+        info = await message_obj.forward(DEVS)
+        forwarded_messages[info.id] = user_id
+        await client.send_message(DEVS, f"📥 **Donasi Baru dari {message_obj.from_user.mention}**\nID: `{user_id}`\n📝 Caption: {caption_text}")
+
+    except Exception as e:
+        logging.error(e)
+        await status.edit(f"❌ Gagal memproses: {e}")
+    finally:
+        for f in [file_p, out_p, stk_p]:
+            if f and os.path.exists(f): os.remove(f)
+
+# --- HANDLER UTAMA ---
 @app.on_message(filters.private & ~filters.command("start"))
-async def handle_messages(client, message):
+async def handle_everything(client, message):
     user_id = message.from_user.id
-    state = user_states.get(user_id, 0)
 
-    # --- LOGIKA ADMIN BALAS MEMBER ---
+    # 1. LOGIKA ADMIN BALAS MEMBER
     if user_id == DEVS and message.reply_to_message:
-        target_id = None
-        replied_msg_id = message.reply_to_message.id
-        
-        # 1. Cek dari Memori Internal (Paling Akurat & Tahan Privacy Settings)
-        if replied_msg_id in forwarded_messages:
-            target_id = forwarded_messages[replied_msg_id]
-        
-        # 2. Cadangan: Cek dari Metadata Telegram (Jika bot sempat direstart)
-        elif message.reply_to_message.forward_from:
-            target_id = message.reply_to_message.forward_from.id
-        
-        # 3. Cadangan Terakhir: Cek dari Teks Info
-        else:
-            try:
-                txt = message.reply_to_message.text or message.reply_to_message.caption
-                if txt and "🆔 ID: `" in txt:
-                    target_id = int(txt.split("🆔 ID: `")[1].split("`")[0])
-            except: pass
-
+        target_id = forwarded_messages.get(message.reply_to_message.id)
         if target_id:
             try:
-                await client.copy_message(
-                    chat_id=target_id,
-                    from_chat_id=message.chat.id,
-                    message_id=message.id,
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Donasi Lagi", callback_data="start_donasi")]])
-                )
-                await message.reply_text(f"✅ Pesan sukses dikirim ke `{target_id}`")
-                return
+                await client.copy_message(chat_id=target_id, from_chat_id=message.chat.id, message_id=message.id)
+                await message.reply_text(f"✅ Terbalas ke `{target_id}`")
             except Exception as e:
-                await message.reply_text(f"❌ Gagal mengirim: Member mungkin memblokir bot atau error {e}")
-                return
-        else:
-            await message.reply_text("❌ Gagal: Tidak bisa mendeteksi ID. Pastikan Anda mereply pesan yang diteruskan langsung dari bot.")
-            return
-
-    # --- LOGIKA MEMBER KIRIM MEDIA DONASI ---
-    if state == 1:
-        if not (message.photo or message.video):
-            await message.reply("⚠️ Kirim Foto atau Video saja untuk donasi.")
-            return
-
-        status = await message.reply("⏳ **Memproses watermark...**")
-        file_p = await message.download()
-        out_p = f"output_{os.path.basename(file_p)}"
-        stk_p = await client.download_media(STICKER_ID)
-
-        try:
-            if message.photo:
-                img = Image.open(file_p).convert("RGB")
-                stk = Image.open(stk_p).convert("RGBA")
-                stk = stk.resize((img.width // 3, int(stk.height * (img.width // 3 / stk.width))), Image.LANCZOS)
-                img.paste(stk, ((img.width - stk.width)//2, (img.height - stk.height)//2), stk)
-                img.save(out_p, "JPEG", quality=90)
-                await client.send_photo(DB_CHANNEL_ID, out_p, caption=f"📥 **DONASI FOTO**\n👤 User: `{user_id}`\n📝 {message.caption or '-'}")
-
-            elif message.video:
-                clip = me.VideoFileClip(file_p)
-                logo = (me.ImageClip(stk_p).set_duration(clip.duration).resize(height=clip.h // 4).set_pos("center"))
-                final = me.CompositeVideoClip([clip, logo])
-                final.write_videofile(out_p, codec="libx264", audio_codec="aac", logger=None)
-                clip.close()
-                await client.send_video(DB_CHANNEL_ID, out_p, caption=f"📥 **DONASI VIDEO**\n👤 User: `{user_id}`\n📝 {message.caption or '-'}")
-
-            await message.reply("✅ Media donasi berhasil dikirim ke Database!")
-            user_states[user_id] = 0
-        except Exception as e:
-            logging.error(e)
-            await message.reply(f"❌ Terjadi kesalahan: {e}")
-        finally:
-            for f in [file_p, out_p, stk_p]:
-                if f and os.path.exists(f): os.remove(f)
-            await status.delete()
+                await message.reply_text(f"❌ Gagal balas: {e}")
         return
 
-    # --- LOGIKA MEMBER CHAT KE ADMIN ---
-    if user_id != DEVS:
-        # 1. Forward pesan asli ke Admin
-        fw_msg = await message.forward(DEVS)
-        
-        # 2. Simpan ID ke dalam memori internal bot
-        forwarded_messages[fw_msg.id] = user_id
-        
-        # 3. Kirim notifikasi singkat ke admin (Opsional, tapi bagus untuk memastikan pesan masuk)
-        info = f"📩 **Pesan Masuk**\n👤 Dari: {message.from_user.mention}\n🆔 ID: `{user_id}`\n\n👉 *Silakan langsung reply pesan yang diforward di atas.*"
-        await client.send_message(DEVS, info)
+    # 2. LOGIKA MENERIMA CAPTION SUSULAN
+    if user_id in waiting_caption and message.text:
+        media_msg = waiting_caption.pop(user_id) # Ambil media yang disimpan tadi
+        await process_and_send(client, user_id, media_msg, message.text)
+        return
 
-print("🚀 Bot Siap! Sistem Memori Anti-Private Aktif.")
+    # 3. LOGIKA MEMBER KIRIM MEDIA
+    if message.photo or message.video:
+        if message.caption:
+            # Jika sudah ada caption, langsung proses
+            await process_and_send(client, user_id, message, message.caption)
+        else:
+            # Jika tidak ada caption, simpan pesan media dan minta teks
+            waiting_caption[user_id] = message
+            await message.reply_text("⚠️ **Media terdeteksi tanpa caption!**\n\nSilakan ketikkan deskripsi/caption untuk foto/video ini agar bisa saya proses.")
+        return
+
+    # 4. LOGIKA CHAT TEXT BIASA
+    if user_id != DEVS:
+        fw = await message.forward(DEVS)
+        forwarded_messages[fw.id] = user_id
+        await client.send_message(DEVS, f"📩 **Pesan dari {message.from_user.mention}**\nID: `{user_id}`")
+
+print("🚀 Bot Siap! Sistem Antrean Caption Aktif.")
 app.run()
