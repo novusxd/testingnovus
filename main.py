@@ -7,9 +7,15 @@ from dotenv import load_dotenv
 from PIL import Image
 import moviepy.editor as me
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import ServerSelectionTimeoutError
 
-# Konfigurasi Logging
-logging.basicConfig(level=logging.INFO)
+# Konfigurasi Logging agar muncul di terminal
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("NovusBot")
+
 load_dotenv()
 
 # Ambil data dari .env
@@ -21,15 +27,15 @@ try:
     DB_CHANNEL = int(os.getenv("DB_CHANNEL"))
     STICKER_ID = os.getenv("STICKER_ID")
     MONGO_URL = os.getenv("MONGO_URL")
-except (TypeError, ValueError) as e:
-    print(f"❌ ERROR: Konfigurasi .env tidak valid! | {e}")
+except Exception as e:
+    logger.error(f"Gagal memuat .env: {e}")
     exit()
 
-# MongoDB Setup
-mongo_client = AsyncIOMotorClient(MONGO_URL)
+# MongoDB Setup dengan Timeout 5 detik agar tidak hang
+mongo_client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=5000)
 db = mongo_client["NovusBotDB"]
 users_col = db["nvs_users"]
-config_col = db["nvs_config"] # Koleksi baru untuk menyimpan status sistem
+config_col = db["nvs_config"]
 
 app = Client("TestingNovusBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -38,45 +44,38 @@ waiting_caption = {}
 
 # --- FUNGSI DATABASE ---
 async def add_user(user_id):
-    await users_col.update_one({"_id": user_id}, {"$set": {"_id": user_id}}, upsert=True)
-
-async def remove_user(user_id):
-    await users_col.delete_one({"_id": user_id})
-
-async def get_all_users():
-    return [doc["_id"] async for doc in users_col.find()]
-
-# --- FUNGSI VERIFIKASI CHANNEL (SISTEM MEMORI MONGO) ---
-async def ensure_channel_verified():
-    """Mengecek apakah channel sudah pernah diverifikasi sebelumnya."""
-    print(f"🔍 Mengecek status verifikasi channel {DB_CHANNEL}...")
-    
-    # Cek di DB apakah sudah verified
-    check = await config_col.find_one({"_id": "channel_verification"})
-    
-    if check and check.get("verified") is True:
-        print("✅ Channel sudah terverifikasi di Database. Melewati silent ping.")
-        return
-
-    # Jika belum verified, lakukan Silent Ping
-    print("🔄 Channel belum terverifikasi. Memulai Silent Ping...")
     try:
-        pancing = await app.send_message(DB_CHANNEL, "🔄 **System: Initializing Peer ID...**")
+        await users_col.update_one({"_id": user_id}, {"$set": {"_id": user_id}}, upsert=True)
+    except Exception as e:
+        logger.error(f"Gagal simpan user ke DB: {e}")
+
+async def ensure_channel_verified():
+    logger.info(f"🔍 Mengecek verifikasi channel {DB_CHANNEL}...")
+    try:
+        # Cek status di MongoDB
+        check = await config_col.find_one({"_id": "channel_verification"})
+        if check and check.get("verified"):
+            logger.info("✅ Channel sudah terverifikasi sebelumnya.")
+            return
+
+        # Silent Ping jika belum verified
+        logger.info("🔄 Melakukan Silent Ping ke Channel...")
+        pancing = await app.send_message(DB_CHANNEL, "🔄 **System Sync...**")
         await asyncio.sleep(1)
         await pancing.delete()
         
-        # Simpan status ke MongoDB agar tidak mengulang lagi selamanya
         await config_col.update_one(
             {"_id": "channel_verification"}, 
-            {"$set": {"verified": True, "channel_id": DB_CHANNEL}}, 
+            {"$set": {"verified": True}}, 
             upsert=True
         )
-        print("✅ Sinkronisasi ID Berhasil & Status Disimpan ke MongoDB!")
+        logger.info("✅ Verifikasi Berhasil Simpan ke DB.")
+    except ServerSelectionTimeoutError:
+        logger.error("❌ KONEKSI MONGO TIMEOUT! Pastikan IP VPS sudah di-whitelist di MongoDB Atlas.")
     except Exception as e:
-        print(f"❌ Gagal sinkronisasi: {e}")
-        print("⚠️ Pastikan Bot sudah Admin di channel tersebut.")
+        logger.error(f"❌ Gagal verifikasi channel: {e}")
 
-# --- FUNGSI WATERMARK MEDIA ---
+# --- FUNGSI MEDIA ---
 async def process_media(client, user_id, message_obj, caption_text):
     status = await client.send_message(user_id, "⏳ **Memproses watermark...**")
     file_p = await message_obj.download()
@@ -99,11 +98,11 @@ async def process_media(client, user_id, message_obj, caption_text):
             clip.close()
             await client.send_video(DB_CHANNEL, out_p, caption=caption_text)
 
-        await status.edit("✅ **Tersimpan di Database!**")
+        await status.edit("✅ **Berhasil terkirim ke Database.**")
         info = await message_obj.forward(DEVS)
         forwarded_messages[info.id] = user_id
     except Exception as e:
-        await status.edit(f"❌ Gagal: {e}")
+        await status.edit(f"❌ Terjadi kesalahan: {e}")
     finally:
         for f in [file_p, out_p, stk_p]:
             if f and os.path.exists(f): os.remove(f)
@@ -111,35 +110,21 @@ async def process_media(client, user_id, message_obj, caption_text):
 # --- HANDLERS ---
 @app.on_message(filters.command("start") & filters.private)
 async def start_cmd(client, message):
+    logger.info(f"Pesan /start dari {message.from_user.id}")
     await add_user(message.from_user.id)
-    await message.reply_text(f"👋 **Halo {message.from_user.first_name}!**\nKirim media untuk donasi.")
+    await message.reply_text(f"👋 **Halo {message.from_user.first_name}!**\nBot sudah aktif. Silakan kirim media.")
 
 @app.on_message(filters.command("stats") & filters.user(DEVS))
 async def stats_cmd(client, message):
     count = await users_col.count_documents({})
-    await message.reply_text(f"📊 **Statistik Database**\nTotal User (nvs): `{count}`")
+    await message.reply_text(f"📊 Total User: `{count}`")
 
-@app.on_message(filters.command("broadcast") & filters.user(DEVS) & filters.reply)
-async def broadcast_cmd(client, message):
-    all_users = await get_all_users()
-    msg = message.reply_to_message
-    sent, failed = 0, 0
-    status = await message.reply_text(f"🚀 **Broadcast sedang jalan...**")
-    for u_id in all_users:
-        try:
-            await msg.copy(u_id)
-            sent += 1
-            await asyncio.sleep(0.3)
-        except Exception:
-            await remove_user(u_id)
-            failed += 1
-    await status.edit(f"✅ Selesai!\nBerhasil: `{sent}`\nGagal/Dihapus: `{failed}`")
-
-@app.on_message(filters.private & ~filters.command(["start", "stats", "broadcast"]))
+@app.on_message(filters.private & ~filters.command(["start", "stats"]))
 async def handle_msg(client, message):
     u_id = message.from_user.id
     await add_user(u_id)
 
+    # Admin Reply
     if u_id == DEVS and message.reply_to_message:
         target = forwarded_messages.get(message.reply_to_message.id)
         if target:
@@ -147,31 +132,43 @@ async def handle_msg(client, message):
             except: pass
         return
 
+    # Waiting Caption
     if u_id in waiting_caption and message.text:
         media_msg = waiting_caption.pop(u_id)
         await process_media(client, u_id, media_msg, message.text)
         return
 
+    # Media Check
     if message.photo or message.video:
         if message.caption:
             await process_media(client, u_id, message, message.caption)
         else:
             waiting_caption[u_id] = message
-            await message.reply_text("⚠️ **Berikan caption/deskripsi untuk media ini!**")
+            await message.reply_text("⚠️ **Silakan kirim caption/deskripsi!**")
         return
 
+    # Forward to Admin
     if u_id != DEVS:
         fw = await message.forward(DEVS)
         forwarded_messages[fw.id] = u_id
-        await client.send_message(DEVS, f"📩 **Pesan dari {message.from_user.mention}**\nID: `{u_id}`")
+        await client.send_message(DEVS, f"📩 Pesan dari `{u_id}`")
 
-# --- BOOTSTRAP ---
+# --- MAIN ---
 async def main():
+    logger.info("🚀 Memulai Bot...")
     await app.start()
-    # Menjalankan verifikasi cerdas berbasis MongoDB
-    await ensure_channel_verified() 
-    print("🚀 Bot Novus Aktif & Siap Bekerja!")
+    
+    # Cek Koneksi DB & Verifikasi Channel
+    try:
+        await ensure_channel_verified()
+    except Exception as e:
+        logger.error(f"Gagal verifikasi saat startup: {e}")
+
+    logger.info("✅ Bot Novus Ready!")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot dihentikan.")
