@@ -29,6 +29,7 @@ except (TypeError, ValueError) as e:
 mongo_client = AsyncIOMotorClient(MONGO_URL)
 db = mongo_client["NovusBotDB"]
 users_col = db["nvs_users"]
+config_col = db["nvs_config"] # Koleksi baru untuk menyimpan status sistem
 
 app = Client("TestingNovusBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -45,21 +46,37 @@ async def remove_user(user_id):
 async def get_all_users():
     return [doc["_id"] async for doc in users_col.find()]
 
-# --- FUNGSI FIX PEER ID (SILENT PING) ---
-async def fix_peer_id():
-    """Memaksa bot mengenali ID Channel dengan mengirim pesan lalu menghapusnya."""
-    print(f"🔄 Sinkronisasi ID Channel: {DB_CHANNEL}...")
+# --- FUNGSI VERIFIKASI CHANNEL (SISTEM MEMORI MONGO) ---
+async def ensure_channel_verified():
+    """Mengecek apakah channel sudah pernah diverifikasi sebelumnya."""
+    print(f"🔍 Mengecek status verifikasi channel {DB_CHANNEL}...")
+    
+    # Cek di DB apakah sudah verified
+    check = await config_col.find_one({"_id": "channel_verification"})
+    
+    if check and check.get("verified") is True:
+        print("✅ Channel sudah terverifikasi di Database. Melewati silent ping.")
+        return
+
+    # Jika belum verified, lakukan Silent Ping
+    print("🔄 Channel belum terverifikasi. Memulai Silent Ping...")
     try:
-        # Kirim pesan pancingan agar Bot mengenal ID ini
-        pancing = await app.send_message(DB_CHANNEL, "🔄 *Bot System Synchronizing...*")
+        pancing = await app.send_message(DB_CHANNEL, "🔄 **System: Initializing Peer ID...**")
         await asyncio.sleep(1)
-        await pancing.delete() # Hapus lagi agar channel tetap bersih
-        print("✅ Sinkronisasi ID Berhasil! Bot sekarang mengenali Channel Database.")
+        await pancing.delete()
+        
+        # Simpan status ke MongoDB agar tidak mengulang lagi selamanya
+        await config_col.update_one(
+            {"_id": "channel_verification"}, 
+            {"$set": {"verified": True, "channel_id": DB_CHANNEL}}, 
+            upsert=True
+        )
+        print("✅ Sinkronisasi ID Berhasil & Status Disimpan ke MongoDB!")
     except Exception as e:
         print(f"❌ Gagal sinkronisasi: {e}")
-        print("⚠️ Pastikan Bot sudah menjadi ADMIN di channel dan memiliki izin 'Post Messages'.")
+        print("⚠️ Pastikan Bot sudah Admin di channel tersebut.")
 
-# --- FUNGSI PROSES MEDIA ---
+# --- FUNGSI WATERMARK MEDIA ---
 async def process_media(client, user_id, message_obj, caption_text):
     status = await client.send_message(user_id, "⏳ **Memproses watermark...**")
     file_p = await message_obj.download()
@@ -95,7 +112,7 @@ async def process_media(client, user_id, message_obj, caption_text):
 @app.on_message(filters.command("start") & filters.private)
 async def start_cmd(client, message):
     await add_user(message.from_user.id)
-    await message.reply_text(f"👋 **Halo {message.from_user.first_name}!**\nKirim foto/video untuk donasi.")
+    await message.reply_text(f"👋 **Halo {message.from_user.first_name}!**\nKirim media untuk donasi.")
 
 @app.on_message(filters.command("stats") & filters.user(DEVS))
 async def stats_cmd(client, message):
@@ -151,8 +168,9 @@ async def handle_msg(client, message):
 # --- BOOTSTRAP ---
 async def main():
     await app.start()
-    await fix_peer_id() # Sinkronisasi ID via pesan pancingan
-    print("🚀 Bot Novus Aktif & Database Sinkron!")
+    # Menjalankan verifikasi cerdas berbasis MongoDB
+    await ensure_channel_verified() 
+    print("🚀 Bot Novus Aktif & Siap Bekerja!")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
